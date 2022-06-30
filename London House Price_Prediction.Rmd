@@ -1,0 +1,738 @@
+---
+title: 'Session 10: Data Science London Housing Project'
+author: "Ding Linli"
+date: "`r Sys.Date()`"
+output: 
+    html_document:
+      number_sections: true
+      highlight: haddock
+      theme: spacelab
+      toc: yes
+      toc_depth: 2
+      toc_float:
+        collapsed: false
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+<style>
+div.navy1 { background-color:#686868; border-radius: 5px; padding: 20px; border-style: groove; color: #ffffff;}
+
+</style>
+
+```{r, set seed, warning=FALSE,  message=FALSE}
+set.seed(1) # to return the same result in the following chunks
+```
+
+
+
+```{r, load_libraries, include = FALSE}
+
+if(!is.element("tidyverse", installed.packages()[,1]))
+{  install.packages("tidyverse")}
+
+if(!is.element("Hmisc", installed.packages()[,1]))
+{  install.packages("Hmisc")} #package for data summary using `describe`
+
+if(!is.element("ggplot2", installed.packages()[,1]))
+{  install.packages("ggplot2")} #package for plots
+if(!is.element("ggthemes", installed.packages()[,1]))
+{  install.packages("ggthemes")} #package to make fancier ggplots
+
+if(!is.element("janitor", installed.packages()[,1]))
+{ install.packages("janitor")} #package to visualize results of machine learning tools
+if(!is.element("rpart.plot", installed.packages()[,1]))
+{  install.packages("rpart.plot")} #package to visualize trees
+
+library(rpart.plot)
+library(caret)
+library(tidyverse) # the usual stuff: dplyr, readr, and other goodies
+library(lubridate)
+library(janitor) # clean_names()
+library(Hmisc)
+library(skimr)
+library(lubridate)
+library(zoo)
+library(here)
+library(sf)
+library(tmap)
+library(caretEnsemble) # caretList() ensemble
+library(rsample) # train-test split
+library(RWeka)
+library(PostcodesioR) # to map lng lat with postcode
+library(brnn)
+
+
+```
+
+# Introduction and learning objectives
+
+<div class = "navy1">
+The purpose of this exercise is to build an estimation engine to guide investment decisions in London house market. You will first build machine learning algorithms (and tune them) to estimate the house prices given variety of information about each property. Then, using your algorithm, you will choose 200 houses to invest in out of about 2000 houses on the market at the moment.
+
+
+<b>Learning objectives</b>
+ 
+<ol type="i">
+  <li>Using different data mining algorithms for prediction.</li>
+  <li>Dealing with large data sets</li>
+  <li>Tuning data mining algorithms</li>
+  <li>Interpreting data mining algorithms and deducing importance of variables</li>
+  <li>Using results of data mining algorithms to make business decisions</li>
+</ol>  
+</div>
+
+# Load data
+
+There are two sets of data, i) training data that has the actual prices ii) out of sample data that has the asking prices. Load both data sets. 
+
+Make sure you understand what information each column contains. Note that not all information provided might be useful in predicting house prices, but do not make any assumptions before you decide what information you use in your prediction algorithms.
+
+```{r read-investigate, warning=FALSE,  message=FALSE}
+#read in the data
+
+london_house_prices_2019_training<-read.csv("training_data_assignment_with_prices.csv")
+london_house_prices_2019_out_of_sample<-read.csv("test_data_assignment.csv")
+
+
+
+#fix data types in both data sets
+
+#fix dates
+london_house_prices_2019_training <- london_house_prices_2019_training %>% mutate(date=as.Date(date))
+london_house_prices_2019_out_of_sample<-london_house_prices_2019_out_of_sample %>% mutate(date=as.Date(date))
+#change characters to factors
+london_house_prices_2019_training <- london_house_prices_2019_training %>% mutate_if(is.character,as.factor)
+london_house_prices_2019_out_of_sample<-london_house_prices_2019_out_of_sample %>% mutate_if(is.character,as.factor)
+
+#take a quick look at what's in the data
+str(london_house_prices_2019_training)
+str(london_house_prices_2019_out_of_sample)
+
+
+
+```
+
+Additional data features will be added as below. The two chosen features are `school_number` and `crime_number`. The school data is from 2016. The crime number is the total crime as of year 2020. 
+
+```{r, number of schools, warning=FALSE,  message=FALSE}
+# number of school data source https://data.gov.uk/dataset/6b776872-c786-4960-af1d-dab521aa4ab0/london-schools-atlas
+
+education <- read_sf(here("data/All_schools_shp/school_data_london_Atlas_2016.shp"))
+
+borough_education <- education %>% 
+  group_by(LA_NAME) %>% 
+  summarise(school_number = n())
+
+borough_education <- as.data.frame(borough_education) %>% 
+  select(-geometry)
+
+# training add education feature
+training_education <- london_house_prices_2019_training %>%
+  left_join(borough_education, by=c("district" = "LA_NAME"))
+
+# out-of-sample add education feature
+testing_education <- london_house_prices_2019_out_of_sample %>%
+  left_join(borough_education, by=c("district" = "LA_NAME"))
+
+```
+
+```{r, number of crime, warning=FALSE,  message=FALSE}
+#crime data source https://data.london.gov.uk/dataset/recorded_crime_summary
+
+crime <- read_csv(here("data/MPS Borough Level Crime (most recent 24 months).csv"))
+
+colnames(crime)[5:16] = c("crime202001", "crime202002", "crime202003", "crime202004", "crime202005", "crime202006", "crime202007", "crime202008", "crime202009", "crime202010", "crime202011", "crime202012")
+
+number <- crime %>%  
+  select(crime202001, crime202002, crime202003, crime202004, crime202005, crime202006, crime202007, crime202008, crime202009, crime202010, crime202011, crime202012)
+
+number_crime <- number %>% 
+  mutate(crime_number = rowSums(number))
+
+borough_crime <- as.data.frame(cbind(crime, number_crime$crime_number))
+colnames(borough_crime)[28] = c("crime_number")
+
+borough_crime <- borough_crime %>% 
+  select(LookUp_BoroughName, crime_number) %>% 
+  group_by(LookUp_BoroughName) %>% 
+  summarise(crime_number = sum(crime_number))
+
+# training add crime feature
+london_house_prices_2019_training <- training_education %>%
+  left_join(borough_crime, by=c("district" = "LookUp_BoroughName")) %>% 
+  filter(!is.na(crime_number)) %>% 
+  filter(!is.na(population))
+
+# training set scale the useful numeric data
+features_needs_scaling <- london_house_prices_2019_training %>% 
+  select(total_floor_area, co2_emissions_current, energy_consumption_current, latitude, longitude, london_zone, average_income, num_light_rail_lines, num_rail_lines, num_tube_lines, distance_to_station, school_number, crime_number)
+features_needs_scaling <- scale(features_needs_scaling, center=FALSE, scale=TRUE)
+temp <- london_house_prices_2019_training %>% 
+  select(-colnames(features_needs_scaling))
+london_house_prices_2019_training <- as.data.frame(cbind(temp,features_needs_scaling))
+
+# out-of-sample set add crime feature
+london_house_prices_2019_out_of_sample <- testing_education %>%
+  left_join(borough_crime, by=c("district" = "LookUp_BoroughName")) %>% 
+  filter(!is.na(crime_number)) %>% 
+  filter(!is.na(population))
+
+# out-of-sample set scale the useful numeric data
+features_needs_scaling <- london_house_prices_2019_out_of_sample %>% 
+  select(total_floor_area, co2_emissions_current, energy_consumption_current, latitude, longitude, london_zone, average_income, num_light_rail_lines, num_rail_lines, num_tube_lines, distance_to_station, school_number, crime_number)
+features_needs_scaling <- scale(features_needs_scaling, center=FALSE, scale=TRUE)
+temp <- london_house_prices_2019_out_of_sample %>% 
+  select(-colnames(features_needs_scaling))
+london_house_prices_2019_out_of_sample <- as.data.frame(cbind(temp,features_needs_scaling))
+
+```
+
+```{r skim_training, warning=FALSE,  message=FALSE}
+skim(london_house_prices_2019_training)
+```
+
+```{r skim_out_of_sample, warning=FALSE,  message=FALSE}
+skim(london_house_prices_2019_out_of_sample)
+```
+
+From the skim result, we can see that although some of the variables have high complete rate in training set, the corresponding variables in out-of-sample set is close to 0. For example, `post_code` is complete in training set but empty in out-of-sample set. This means that in the following model building, this variable should not be used for training purpose, alternatively, `postcode_short` should be used since it has high complete rate in both training and out-of-sample sets. 
+
+```{r split the price data to training and testing, warning=FALSE,  message=FALSE}
+set.seed(1) # to return the same result in the following chunks
+
+#let's do the initial split
+train_test_split <- initial_split(london_house_prices_2019_training, prop = 0.75) #training set contains 75% of the data
+# Create the training dataset
+train_data <- training(train_test_split)
+test_data <- testing(train_test_split)
+
+```
+
+
+# Visualize data 
+
+Visualize and examine the data. What plots could be useful here? What do you learn from these visualizations?
+
+```{r, vis1, warning=FALSE,  message=FALSE}
+ggplot(london_house_prices_2019_training, aes(x=price)) + 
+  geom_density() +
+  theme_minimal() +
+  labs(title = "Price is extremely right-skewed",
+       subtitle = "Density plot of price",
+       x = "Price",
+       y = "Density")
+
+```
+
+We can see from the density plot that the price is mostly concentrated at low value with high-value outliers. Therefore, log transformation will be used to decrease the impact of high-value outliers, and thus making it easier to visualize the distribution of prices. 
+
+```{r, vis2, warning=FALSE,  message=FALSE}
+
+p1 <- ggplot(london_house_prices_2019_training, aes(x=log(price), fill = property_type)) + 
+  geom_boxplot() +
+  theme_minimal() +
+  labs(title = "Outliers exist mostly on right tail for most property types with exception of type F",
+       subtitle = "Boxplot of log house prices",
+       x="Log price",
+       fill = "Property type")
+
+p1
+```
+
+From the boxplot we can see that different property types have different distribution of log price according to the illustration above. We can see that F, which stands for flat, has relatively low prices compared to other types. It also has more lower-end outliers, meaning that some flats (e.g., basement flat) have significantly low prices. Type D, which stands for detached, have on average higher prices than other property types. This is intuitively the case in that detached houses are higher class and more luxurious in general. We can also see that S, which stands for semi-detached houses, has the smallest quantile range. 
+
+```{r, vis3, warning=FALSE,  message=FALSE}
+house_training <- london_house_prices_2019_training %>% 
+  mutate(yrmon= as.yearmon(date)) %>% 
+  group_by(nearest_station) %>% 
+  summarise(median_price = median(price)) %>% 
+  slice_max(median_price, n = 10) %>% 
+  mutate( ToHighlight = ifelse( nearest_station == "hyde park corner"|nearest_station == "knightsbridge", "yes", "no" ) )
+
+
+p2 <- ggplot(house_training, aes(x = reorder(nearest_station, -median_price), y = median_price, fill = ToHighlight))+
+  geom_bar(stat="identity")+
+  scale_fill_manual( values = c( "yes"="tomato", "no"="gray" ), guide = FALSE ) +
+  theme_minimal() +
+  theme(axis.text.x=element_text(angle=45, hjust=1)) +
+  labs(title = "House price near Hyde Park Corner and Knightsbridge are the highest",
+       subtitle = "Top 10 stations with highest median house price",
+       x = "Nearest station",
+       y = "Median house price")
+
+p2
+```
+
+Since average housing price is sensitive to outliers, we use median to represent the housing price level near each station. Looking closely, we can see that the first 6 stations are all a stone’s throw to parks (incl., Hyde Park, Green Park, Regent’s Park). We can also see that Hyde Park Corner station has the highest median price, this is probably because of i) the nice environment surrounded by Hyde Park and Buckingham Palace; ii) prime location which is 23 minutes from the central business district (City of London). The second richest neighborhood is Knightsbridge, which is 7 minutes walk from Hyde Park Corner station. Houses around these two stations seem to be significantly higher than other 8 stations in the top 10 stations with highest median house prices. 
+
+```{r, visualize4, warning=FALSE,  message=FALSE}
+london_wards_sf <- read_sf(here("data/London-wards-2018_ESRI/London_Ward.shp"))
+city_of_london_wgs84 <- london_wards_sf %>% 
+  st_transform(4326)
+
+price_district <- london_house_prices_2019_training %>% 
+  group_by(district) %>% 
+  summarise(median_price = median(price))
+
+price_district[price_district == "City and County of the City of London"] <- "City of London"
+price_district[price_district == "Westminster"] <- "City of Westminster"
+
+
+price_wards <- city_of_london_wgs84 %>%
+  left_join(price_district, by=c("DISTRICT" = "district"))
+
+tmap::tmap_mode("view")
+tmap::tm_shape(price_wards) +
+  tm_polygons("median_price",
+              palette = "Reds",
+              title='Median housing price among districts') + 
+  tm_layout(title= 'Pricy houses are centered around central-west London', 
+            title.position = c('right', 'top'),
+            legend.position = c("left","bottom"))
+```
+
+ From the graph above we can see that the most pricy houses are concentrated around central and west London. This is the case because west London has more advanced infrastructures, parks and mansions that attract the middle to upper class investors. 
+Note that our dataset does not include any observations in the district of the City of London. Therefore, the model developed in the following is not used to predict prices in the City of London. 
+
+Estimate a correlation table between prices and other continuous variables. What do you glean from the correlation table?
+
+```{r, correlation table, warning=FALSE, message=FALSE}
+
+# produce a correlation table using GGally::ggcor()
+
+library("GGally")
+london_house_prices_2019_training %>% 
+  select(-ID) %>% #keep Y variable last
+  ggcorr(method = c("pairwise", "pearson"), layout.exp = 2,label_round=2, label = TRUE,label_size = 2,hjust = 1,nbreaks = 5,size = 2,angle = -20)+
+  labs(title = "Price has highest correlation with total floor area",
+       subtitle ="Correlation table of numeric variables")
+
+```
+
+Correlation matrix between pairs attributed in Table 1 is presented. The coefficient ranges between -1 and 1, where 1 means two attributes have strong and positive association. In contrast, -1 means two attributes have strong and negative associations. And 0 means the pair is perfectly uncorrelated. As shown in Fig. 2, attribute ‘price’ has a strong positive relationship with attributes ‘total floor area’, ‘number of habitable rooms’, ‘co2 emissions potential’, ‘co2 emissions current’, ‘average income’ and ‘number of tube lines’. In contrast, the attribute ‘Price’ has a strong negative relationship with attributes ‘energy consumption potential’, ‘London zone’. 
+Intuitively, the bigger the house is, the higher the price. This can explain the positive correlation between ‘total floor area’ and ‘price’, ‘number of habitable rooms’ and ‘price’. And the richer the neighborhood, the higher the price of the house. This can explain the positive correlation between ‘average income’ and ‘price’. The more central the location is, the higher the price. This can explain the negative correlation between ‘London zone’ and ‘price’. Since energy efficiency is important for long term investment of a house, the lower the energy consumption, the higher the price. This can explain the negative correlation between ‘energy consumption potential’ and ‘price’. Note that unlike ‘energy consumption current’, which has a high negative correlation with ‘price’, there exhibits a high positive correlation between ‘co2 emission current’ and ‘price’. This is the case because co2 emission, unlike energy consumption, is not penalized in monetary terms for private building owners and therefore is not a critical consideration for investors. And co2 emission is highly correlated with how big the house is. Therefore, the higher the co2 emission current, the higher the price. 
+
+# Fit a linear regression model
+
+To help you get started I build a linear regression model below. I chose a subset of the features with no particular goal. You can (and should) add more variables and/or choose variable selection methods if you want.
+
+Note that among these attributes that are highly correlated with attribute ‘Price’, some pairs of them are highly correlated between themselves (e.g., ‘total floor area’ and ‘co2 emission current’, ‘total floor area’ and ‘number of habitable rooms’, ‘co2 emission current’ and ‘co2 emission potential’). In the following linear regression model training steps, only one attribute from each pair should be used as input for each model. This is due to the multicollinearity problem, which can negatively impact the result of linear regression. This is because the key goal of linear regression is to isolate the relationship between each independent variable (e.g., ‘total floor area’) and the dependent variable (i.e., price). However, when independent variables are correlated (e.g., ‘total floor area’ and ‘co2 emission current’), it means change in ‘total floor area’ shifts ‘co2 emission current’. As a result, the model is difficult to estimate the relationship between each independent variable and the dependent variable since these independent variables tend to change together. Therefore, only one attribute of each pair will be selected as the input into the linear regression model. In the following, I will select ‘total floor area’ as input to avoid multicollinearity. 
+
+```{r, LR model, warning=FALSE,  message=FALSE}
+#Define control variables
+control <- trainControl (
+    method="cv",
+    number=5,
+    verboseIter=TRUE) #by setting this to true the model will report its progress after each estimation
+
+#we are going to train the model and report the results using k-fold cross validation
+model1_lm<-train(
+  price ~ latitude+longitude+london_zone*total_floor_area+crime_number+school_number+distance_to_station+population+property_type,
+  train_data,
+  method = "lm",
+  trControl = control,
+  metric = "RMSE")
+
+# summary of the results
+summary(model1_lm)
+```
+
+
+```{r, LR importance , warning=FALSE,  message=FALSE}
+# variable importance for LR
+importance <- varImp(model1_lm, scale=TRUE)
+plot(importance)
+```
+
+## Predict the values in testing and out of sample data
+
+Below I use the predict function to test the performance of the model in testing data and summarize the performance of the linear regression model. How can you measure the quality of your predictions?
+
+```{r, LR results, warning=FALSE,  message=FALSE}
+set.seed(1) # to return the same result in the following chunks
+
+# We can predict the testing values
+
+predictions <- predict(model1_lm,test_data)
+
+lr_results<-data.frame(  RMSE = RMSE(predictions, test_data$price), 
+                            Rsquare = R2(predictions, test_data$price))
+
+                            
+lr_results                         
+
+#We can predict prices for out of sample data the same way
+predictions_oos <- predict(model1_lm,london_house_prices_2019_out_of_sample)
+```
+
+We can see from the result that Root Mean Square Error (RMSE) is the loss function we try to minimize.
+Rsquared reached 66.5%, meaning that 66.5% of the variance in the dependent variable `price` can be explained by the chosen independent variables collectively. 
+
+# Fit a tree model
+
+Next I fit a tree model using the same subset of features. Again you can (and should) add more variables and tune the parameter of your tree to find a better fit. 
+
+Compare the performance of the linear regression model with the tree model; which one performs better? Why do you think that is the case?
+
+```{r, tree model, warning=FALSE,  message=FALSE}
+set.seed(1) # to return the same result in the following chunks
+
+colnames_out_of_sample <- colnames(london_house_prices_2019_out_of_sample)
+
+# pre-process train data for better tree prediction
+train_data_tree <- train_data %>% 
+  select(price, colnames_out_of_sample[colnames_out_of_sample != "asking_price"], -date, -address1,-address2,-address3, -town, -postcode, -ID, -local_aut, -county) %>% 
+  na.omit()
+
+trctrl <- trainControl(method = "cv", 
+                       number = 5, 
+                       classProbs=TRUE)
+
+Grid <- expand.grid(cp = 0.01)
+
+model2_tree <- train(
+  price ~ latitude+longitude+london_zone+total_floor_area+crime_number+school_number+distance_to_station+property_type,
+  train_data_tree,
+  method = "rpart",
+  metric="RMSE",
+  trControl=trctrl,
+  tuneGrid=Grid) 
+
+#You can view how the tree performs
+model2_tree$results
+
+#You can view the final tree
+rpart.plot(model2_tree$finalModel)
+
+#you can also visualize the variable importance
+importance <- varImp(model2_tree, scale=TRUE)
+plot(importance)
+
+test_data_tree <- test_data %>% 
+  select(price, colnames_out_of_sample[colnames_out_of_sample != "asking_price"], -date, -address1,-address2,-address3, -town, -postcode, -ID, -local_aut, -county) %>% 
+  na.omit()
+
+
+predictions <- predict(model2_tree,test_data_tree)
+
+tree_results<-data.frame(  RMSE = RMSE(predictions, test_data_tree$price), 
+                            Rsquare = R2(predictions, test_data_tree$price))
+
+                            
+tree_results                         
+
+#We can predict prices for out of sample data the same way
+predictions_oos <- predict(model2_tree,london_house_prices_2019_out_of_sample)
+predictions_oos
+```
+
+We can see from the result that the RMSE reached 294609.8, which is 1.1% higher than the RMSE obtained from the linear regression (LR) model. This is the case probably because the tree model predicts the price range instead of the exact price as LR does. Therefore the error is higher. 
+Rsquared reached 69.0%, which is 2.5% higher than that of LR model. This is the case probably because many relationships between independent variables and dependent variable are non-linear, and LR fails to detect the non-linear relationship. Tree model is able to capture the non-linear relationship. Therefore, Rsquared is higher. 
+
+# Other algorithms
+
+Use at least two other algorithms to predict prices. Don't forget to tune the parameters of these algorithms. And then compare the performances of your algorithms to linear regression and trees.
+
+```{r, knn select best k, warning=FALSE,  message=FALSE}
+set.seed(1)
+model3 <- train(
+  price ~ latitude+longitude+london_zone+total_floor_area+crime_number+school_number+distance_to_station+co2_emissions_current+property_type,
+  train_data,
+  method = "knn",
+  trControl = control,
+  tuneLength=10
+    )
+
+# view how the tree performs
+model3$results
+
+knn_performance <- data.frame(k=model3$results$k,
+                RMSE=model3$results$RMSE,
+                Rsquared=model3$results$Rsquared)
+
+highlight <- knn_performance %>% 
+             filter(k==7)
+
+# RMSE for different K
+ggplot(data=knn_performance, aes(x=k, y=RMSE, group=1)) +
+  geom_line()+
+  geom_point()+
+  geom_point(data=highlight, 
+             aes(x=k,y=RMSE), 
+             color='red',
+             size=3) +
+  theme_minimal() +
+  labs(title = "Model achieved lowest RMSE at K=7",
+       subtitle = "RMSE with different K values",
+       x = "K",
+       y = "RMSE")
+
+# Rsquared for different K
+ggplot(data=knn_performance, aes(x=k, y=Rsquared, group=1)) +
+  geom_line()+
+  geom_point()+
+  geom_point(data=highlight, 
+             aes(x=k,y=Rsquared), 
+             color='red',
+             size=3) +
+  theme_minimal() +
+  labs(title = "Model achieved highest Rsquared at K=7",
+       subtitle = "Rsquared with different K values",
+       x = "K",
+       y = "Rsquared")
+```
+We can see that performance achieved its best at k=7. 
+
+```{r, knn with best k, warning=FALSE,  message=FALSE}
+model3_knn <- train(
+  price ~ latitude+longitude+london_zone+total_floor_area+crime_number+school_number+distance_to_station+co2_emissions_current+property_type,
+  train_data,
+  method = "knn",
+  trControl = control,
+  tuneGrid = expand.grid(k = 7) #optimal K
+    )
+
+#you can also visualize the variable importance
+importance <- varImp(model3_knn, scale=TRUE)
+plot(importance)
+
+predictions <- predict(model3_knn,test_data)
+
+knn_results<-data.frame(  RMSE = RMSE(predictions, test_data$price),
+                            Rsquare = R2(predictions, test_data$price))
+
+
+knn_results
+
+#We can predict prices for out of sample data the same way
+predictions_oos <- predict(model3_knn,london_house_prices_2019_out_of_sample)
+predictions_oos
+```
+
+```{r, brnn select best number of neurons, warning=FALSE,  message=FALSE}
+set.seed(1)
+
+# 1 neuron
+model4_brnn1 <- train(
+  price ~ total_floor_area+co2_emissions_current+average_income+latitude+longitude+num_tube_lines+num_rail_lines+population+energy_consumption_current+num_light_rail_lines+london_zone+crime_number+distance_to_station+property_type,
+  train_data,
+  method = "brnn",
+  trControl = control,
+  tuneGrid = expand.grid(neurons=1)
+    )
+predictions <- predict(model4_brnn1,test_data)
+brnn_results1<-data.frame(  RMSE = RMSE(predictions, test_data$price),
+                            Rsquare = R2(predictions, test_data$price))
+
+# 2 neurons
+model4_brnn2 <- train(
+  price ~ total_floor_area+co2_emissions_current+average_income+latitude+longitude+num_tube_lines+num_rail_lines+population+energy_consumption_current+num_light_rail_lines+london_zone+crime_number+distance_to_station+property_type,
+  train_data,
+  method = "brnn",
+  trControl = control,
+  tuneGrid = expand.grid(neurons=2)
+    )
+predictions <- predict(model4_brnn2,test_data)
+brnn_results2<-data.frame(  RMSE = RMSE(predictions, test_data$price),
+                            Rsquare = R2(predictions, test_data$price))
+
+# 3 neurons
+model4_brnn3 <- train(
+  price ~ total_floor_area+co2_emissions_current+average_income+latitude+longitude+num_tube_lines+num_rail_lines+population+energy_consumption_current+num_light_rail_lines+london_zone+crime_number+distance_to_station+property_type,
+  train_data,
+  method = "brnn",
+  trControl = control,
+  tuneGrid = expand.grid(neurons=3)
+    )
+predictions <- predict(model4_brnn3,test_data)
+brnn_results3<-data.frame(  RMSE = RMSE(predictions, test_data$price),
+                            Rsquare = R2(predictions, test_data$price))
+
+# 4 neurons
+model4_brnn4 <- train(
+  price ~ total_floor_area+co2_emissions_current+average_income+latitude+longitude+num_tube_lines+num_rail_lines+population+energy_consumption_current+num_light_rail_lines+london_zone+crime_number+distance_to_station+property_type,
+  train_data,
+  method = "brnn",
+  trControl = control,
+  tuneGrid = expand.grid(neurons=4)
+    )
+predictions <- predict(model4_brnn4,test_data)
+brnn_results4<-data.frame(  RMSE = RMSE(predictions, test_data$price),
+                            Rsquare = R2(predictions, test_data$price))
+
+# 5 neurons
+model4_brnn5 <- train(
+  price ~ total_floor_area+co2_emissions_current+average_income+latitude+longitude+num_tube_lines+num_rail_lines+population+energy_consumption_current+num_light_rail_lines+london_zone+crime_number+distance_to_station+property_type,
+  train_data,
+  method = "brnn",
+  trControl = control,
+  tuneGrid = expand.grid(neurons=5)
+    )
+predictions <- predict(model4_brnn5,test_data)
+brnn_results5<-data.frame(  RMSE = RMSE(predictions, test_data$price),
+                            Rsquare = R2(predictions, test_data$price))
+
+brnn_results<-data.frame(matrix(ncol = 3, nrow = 5))
+x <- c("number_neuron", "RMSE", "Rsquare")
+colnames(brnn_results) <- x
+brnn_results$number_neuron[1] <- 1
+brnn_results$number_neuron[2] <- 2
+brnn_results$number_neuron[3] <- 3
+brnn_results$number_neuron[4] <- 4
+brnn_results$number_neuron[5] <- 5
+
+brnn_results$RMSE[1] <- brnn_results1$RMSE
+brnn_results$RMSE[2] <- brnn_results2$RMSE
+brnn_results$RMSE[3] <- brnn_results3$RMSE
+brnn_results$RMSE[4] <- brnn_results4$RMSE
+brnn_results$RMSE[5] <- brnn_results5$RMSE
+
+
+brnn_results$Rsquare[1] <- brnn_results1$Rsquare
+brnn_results$Rsquare[2] <- brnn_results2$Rsquare
+brnn_results$Rsquare[3] <- brnn_results3$Rsquare
+brnn_results$Rsquare[4] <- brnn_results4$Rsquare
+brnn_results$Rsquare[5] <- brnn_results5$Rsquare
+```
+
+
+```{r, optimal neurons, warning=FALSE,  message=FALSE}
+highlight <- brnn_results %>%
+             filter(number_neuron==3) # optimal number of neurons
+
+ggplot(data=brnn_results, aes(x=number_neuron, y=RMSE, group=1)) +
+  geom_line()+
+  geom_point()+
+  geom_point(data=highlight,
+             aes(x=number_neuron,y=RMSE),
+             color='red',
+             size=3) +
+  theme_minimal() +
+  labs(title = "Model achieved lowest RMSE at 3 neurons",
+       subtitle = "RMSE with different number of neurons",
+       x = "Number of neurons",
+       y = "RMSE")
+
+ggplot(data=brnn_results, aes(x=number_neuron, y=Rsquare, group=1)) +
+  geom_line()+
+  geom_point()+
+  geom_point(data=highlight,
+             aes(x=number_neuron,y=Rsquare),
+             color='red',
+             size=3) +
+  theme_minimal() +
+  labs(title = "Model achieved highest Rsquared at 3 neurons",
+       subtitle = "Rsquared with different number of neurons",
+       x = "Number of neurons",
+       y = "Rsquared")
+```
+
+
+```{r, brnn with best number of neurons, warning=FALSE,  message=FALSE}
+#you can also visualize the variable importance
+importance <- varImp(model4_brnn3, scale=TRUE)
+plot(importance)
+
+#We can predict prices for out of sample data the same way
+predictions_oos <- predict(model4_brnn3,london_house_prices_2019_out_of_sample)
+predictions_oos
+
+```
+
+# Stacking
+
+Use stacking to ensemble your algorithms.
+
+```{r, stacking, warning=FALSE, message=FALSE}
+set.seed(1) # to return the same result in the following chunks
+
+train_predict_lm <- predict(model1_lm,train_data)
+train_predict_tree <- predict(model2_tree,train_data)
+train_predict_knn <- predict(model3_knn,train_data)
+train_predict_brnn <- predict(model4_brnn3,train_data)
+
+stacking_train <- as.data.frame(cbind(train_predict_lm,train_predict_tree,train_predict_knn,train_predict_brnn, train_data$price))
+
+names(stacking_train)[5] <- "price"
+
+#we are going to train the combiner model and report the results using k-fold cross validation
+combiner <- train(
+  price ~ .,
+  stacking_train,
+  method = "lm",
+  trControl = control,
+  metric = "RMSE")
+
+stacking_train$train_predictions <- predict(combiner,stacking_train)
+
+stacking_train_result<-data.frame(  RMSE = RMSE(stacking_train$train_predictions, stacking_train$price),
+                            Rsquare = R2(stacking_train$train_predictions, stacking_train$price))
+
+
+stacking_train_result # performance of combiner model on training data
+
+test_predict_lm <- predict(model1_lm,test_data)
+test_predict_tree <- predict(model2_tree,test_data)
+test_predict_knn <- predict(model3_knn,test_data)
+test_predict_brnn <- predict(model4_brnn3,test_data)
+
+stacking_test <- as.data.frame(cbind(test_predict_lm,test_predict_tree,test_predict_knn,test_predict_brnn))
+
+colnames(stacking_test) = colnames(stacking_train)[1:4]
+
+stacking_test$test_predictions <- predict(combiner,stacking_test)
+
+stacking_test_result<-data.frame(  RMSE = RMSE(stacking_test$test_predictions, test_data$price),
+                            Rsquare = R2(stacking_test$test_predictions, test_data$price))
+
+stacking_test_result # performance of combiner model on testing data
+```
+
+# Pick investments
+
+In this section you should use the best algorithm you identified to choose 200 properties from the out of sample data.
+
+```{r, prediction with final model, warning=FALSE,  message=FALSE}
+set.seed(1) # to return the same result in the following chunks
+
+numchoose=200 # number of houses to invest in
+
+oos<-london_house_prices_2019_out_of_sample
+
+oos_predict_lm <- predict(model1_lm,oos)
+oos_predict_tree <- predict(model2_tree,oos)
+oos_predict_knn <- predict(model3_knn,oos)
+oos_predict_brnn <- predict(model4_brnn3,oos)
+
+stacking_oos <- as.data.frame(cbind(oos_predict_lm,oos_predict_tree,oos_predict_knn,oos_predict_brnn))
+
+colnames(stacking_oos) = colnames(stacking_train)[1:4]
+
+oos$predict <- predict(combiner,stacking_oos)
+
+#predict the value of houses
+
+selection <- oos %>%
+  mutate(profit = (predict - asking_price)/asking_price) %>%
+  slice_max(profit, n = numchoose) %>% # Choose the 200 houses to invest
+  select(ID)
+
+selection$buy <- 1
+
+oos<-read.csv("test_data_assignment.csv")
+
+oos <- oos %>% 
+  left_join(selection, by = "ID")
+
+oos$buy[is.na(oos$buy)] <- 0
+
+#output your choices. Change the name of the file to your "lastname_firstname.csv"
+write.csv(oos,"Ding_Linli.csv")
+
+```
+
+
+
