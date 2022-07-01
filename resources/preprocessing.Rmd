@@ -1,0 +1,35 @@
+---
+title: "preprocessing for visualisations"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r, load_libraries, include = FALSE}
+library(rpart.plot)
+library(caret)
+library(tidyverse) # the usual stuff: dplyr, readr, and other goodies
+library(lubridate)
+library(janitor) # clean_names()
+library(Hmisc)
+library(skimr)
+library(lubridate)
+library(zoo)
+library(here)
+library(sf)
+library(tmap)
+library(caretEnsemble) # caretList() ensemble
+library(rsample) # train-test split
+library(RWeka)
+library(PostcodesioR) # to map lng lat with postcode
+library(brnn)
+```
+
+```{r}
+df <- read.csv("../data/training_data_assignment_with_prices.csv") %>% group_by(district) %>% summarise(avg_price = mean(price), median_price = median(price)) %>% rename(borough = district)
+
+write.csv(df,"preprocessed.csv")
+```
+
